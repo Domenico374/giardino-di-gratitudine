@@ -1,396 +1,484 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Head from 'next/head';
-import { motion, AnimatePresence } from 'framer-motion';
+import Giardino from '../components/Giardino';
 
-export default function Home() {
-  const [entries, setEntries] = useState([]);
-  const [newEntry, setNewEntry] = useState('');
-  const [aiInsight, setAiInsight] = useState('');
-  const [aiSuggestions, setAiSuggestions] = useState('');
-  const [reflectionPrompt, setReflectionPrompt] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState('today');
-  const [weeklyInsight, setWeeklyInsight] = useState('');
+const CHIAVE_VOCI = 'gratitude-entries'; // stesso nome della versione precedente: i ricordi restano
+const CHIAVE_DOMANDA = 'domanda-del-giorno';
+const CHIAVE_CODICE = 'codice-giardino';
 
-  // Carica entries dal localStorage
-  useEffect(() => {
-    const saved = localStorage.getItem('gratitude-entries');
-    if (saved) {
-      setEntries(JSON.parse(saved));
-    }
-    generateReflectionPrompt();
-  }, []);
+// ---------- date ----------
+const chiaveGiorno = (data) => {
+  const d = new Date(data);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+const daChiave = (chiave) => {
+  const [a, m, g] = chiave.split('-').map(Number);
+  return new Date(a, m - 1, g);
+};
+const giornoLungo = (data) => new Date(data).toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+const giornoBreve = (data) => new Date(data).toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
+const ora = (data) => new Date(data).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
 
-  // Salva entries nel localStorage
-  useEffect(() => {
-    if (entries.length > 0) {
-      localStorage.setItem('gratitude-entries', JSON.stringify(entries));
-    }
-  }, [entries]);
+function stagione(data = new Date()) {
+  const m = data.getMonth();
+  if (m >= 2 && m <= 4) return 'primavera';
+  if (m >= 5 && m <= 7) return 'estate';
+  if (m >= 8 && m <= 10) return 'autunno';
+  return 'inverno';
+}
 
-  const callAI = async (action, data = {}) => {
-    setLoading(true);
+// ---------- memoria del browser ----------
+const leggi = (chiave, riserva) => {
+  try {
+    const valore = JSON.parse(localStorage.getItem(chiave));
+    return valore ?? riserva;
+  } catch {
+    return riserva;
+  }
+};
+const scrivi = (chiave, valore) => {
+  try {
+    localStorage.setItem(chiave, JSON.stringify(valore));
+  } catch {}
+};
+
+async function chiediAI(codice, azione, dati = {}) {
+  const risposta = await fetch('/api/ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ codice, azione, ...dati }),
+  });
+  const corpo = await risposta.json().catch(() => ({}));
+  if (!risposta.ok) {
+    const errore = new Error(corpo.errore || "L'AI non risponde in questo momento.");
+    errore.stato = risposta.status;
+    throw errore;
+  }
+  return corpo.testo;
+}
+
+// ---------- ingresso ----------
+function Entrata({ onEntra, messaggio }) {
+  const [codice, setCodice] = useState('');
+  const [visibile, setVisibile] = useState(false);
+  const [errore, setErrore] = useState(messaggio);
+  const [attesa, setAttesa] = useState(false);
+
+  async function entra(evento) {
+    evento.preventDefault();
+    if (!codice) return;
+    setAttesa(true);
+    setErrore('');
     try {
-      const response = await fetch('/api/ai', {
+      const risposta = await fetch('/api/accesso', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, ...data }),
+        body: JSON.stringify({ codice }),
       });
-      const result = await response.json();
-      setLoading(false);
-      return result.result;
-    } catch (error) {
-      console.error('AI call error:', error);
-      setLoading(false);
+      if (risposta.ok) onEntra(codice);
+      else setErrore('Codice di accesso errato.');
+    } catch {
+      setErrore('Non riesco a contattare il sito. Controlla la connessione e riprova.');
+    } finally {
+      setAttesa(false);
+    }
+  }
+
+  return (
+    <form className="entrata foglio" onSubmit={entra}>
+      <label htmlFor="codice" className="etichetta">Codice di accesso</label>
+      <div className="campo-codice">
+        <input
+          id="codice"
+          type={visibile ? 'text' : 'password'}
+          value={codice}
+          onChange={(e) => setCodice(e.target.value)}
+          autoComplete="current-password"
+          spellCheck={false}
+          autoFocus
+        />
+        <button type="button" className="mostra" onClick={() => setVisibile(!visibile)}>
+          {visibile ? 'Nascondi' : 'Mostra'}
+        </button>
+      </div>
+      <button className="principale" type="submit" disabled={attesa || !codice}>
+        {attesa ? 'Controllo…' : 'Entra nel giardino'}
+      </button>
+      {errore && <p className="avviso" role="alert">{errore}</p>}
+    </form>
+  );
+}
+
+// ---------- diario ----------
+function Diario({ codice, onEsci }) {
+  const [voci, setVoci] = useState([]);
+  const [caricato, setCaricato] = useState(false);
+  const [testo, setTesto] = useState('');
+  const [domanda, setDomanda] = useState('');
+  const [commento, setCommento] = useState('');
+  const [spunti, setSpunti] = useState('');
+  const [riassunto, setRiassunto] = useState('');
+  const [inCorso, setInCorso] = useState(''); // quale richiesta all'AI è in corso
+  const [avviso, setAvviso] = useState('');
+  const [vista, setVista] = useState('oggi');
+  const [scelto, setScelto] = useState(null);
+  const [quantiGiorni, setQuantiGiorni] = useState(28);
+  const importa = useRef(null);
+
+  const oggi = chiaveGiorno(new Date());
+
+  // Caricamento iniziale.
+  useEffect(() => {
+    const salvate = leggi(CHIAVE_VOCI, []);
+    setVoci(Array.isArray(salvate) ? salvate : []);
+    setCaricato(true);
+    const piccolo = window.matchMedia('(max-width: 560px)');
+    const adatta = () => setQuantiGiorni(piccolo.matches ? 14 : 28);
+    adatta();
+    piccolo.addEventListener('change', adatta);
+    return () => piccolo.removeEventListener('change', adatta);
+  }, []);
+
+  // Salva sempre, anche quando il diario resta vuoto.
+  useEffect(() => {
+    if (caricato) scrivi(CHIAVE_VOCI, voci);
+  }, [voci, caricato]);
+
+  // Una sola domanda al giorno.
+  useEffect(() => {
+    const salvata = leggi(CHIAVE_DOMANDA, null);
+    if (salvata?.giorno === oggi && salvata.testo) setDomanda(salvata.testo);
+    else nuovaDomanda();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function chiedi(nome, azione, dati) {
+    setInCorso(nome);
+    setAvviso('');
+    try {
+      return await chiediAI(codice, azione, dati);
+    } catch (errore) {
+      if (errore.stato === 401) onEsci('Il codice di accesso è cambiato: inserisci quello nuovo.');
+      else setAvviso(errore.message);
       return null;
+    } finally {
+      setInCorso('');
     }
-  };
+  }
 
-  const addEntry = async () => {
-    if (!newEntry.trim()) return;
-
-    const entry = {
-      id: Date.now(),
-      text: newEntry,
-      date: new Date().toISOString(),
-      insight: '',
-    };
-
-    setEntries([entry, ...entries]);
-    
-    // Ottieni insight dall'AI
-    const insight = await callAI('analyze', { text: newEntry });
-    if (insight) {
-      entry.insight = insight;
-      setEntries([entry, ...entries]);
-      setAiInsight(insight);
+  async function nuovaDomanda() {
+    const risposta = await chiedi('domanda', 'domanda');
+    if (risposta) {
+      setDomanda(risposta);
+      scrivi(CHIAVE_DOMANDA, { giorno: oggi, testo: risposta });
     }
-    
-    setNewEntry('');
-  };
+  }
 
-  const deleteEntry = (id) => {
-    setEntries(entries.filter(e => e.id !== id));
-  };
-
-  const getSuggestions = async () => {
-    const suggestions = await callAI('suggest');
-    setAiSuggestions(suggestions);
-  };
-
-  const generateReflectionPrompt = async () => {
-    const prompt = await callAI('prompt');
-    setReflectionPrompt(prompt);
-  };
-
-  const generateWeeklySummary = async () => {
-    const weekAgo = new Date();
-    weekAgo.setDate(weekAgo.getDate() - 7);
-    
-    const weekEntries = entries.filter(e => new Date(e.date) > weekAgo);
-    
-    if (weekEntries.length === 0) {
-      setWeeklyInsight('Non ci sono abbastanza entrate questa settimana per generare un riassunto.');
-      return;
+  async function aggiungi(evento) {
+    evento.preventDefault();
+    const scritto = testo.trim();
+    if (!scritto) return;
+    const voce = { id: Date.now(), text: scritto, date: new Date().toISOString(), insight: '' };
+    setVoci((prima) => [voce, ...prima]);
+    setTesto('');
+    setCommento('');
+    setSpunti('');
+    setScelto(null);
+    setVista('oggi');
+    const risposta = await chiedi('commento', 'commento', { testo: scritto });
+    if (risposta) {
+      setCommento(risposta);
+      setVoci((prima) => prima.map((v) => (v.id === voce.id ? { ...v, insight: risposta } : v)));
     }
-    
-    const summary = await callAI('weekly', { entries: weekEntries });
-    setWeeklyInsight(summary);
-  };
+  }
 
-  const getTodayEntries = () => {
-    const today = new Date().toDateString();
-    return entries.filter(e => new Date(e.date).toDateString() === today);
-  };
+  function elimina(voce) {
+    if (!window.confirm(`Eliminare questa gratitudine del ${giornoBreve(voce.date)}?`)) return;
+    setVoci((prima) => prima.filter((v) => v.id !== voce.id));
+  }
 
-  const formatDate = (dateString) => {
-    const date = new Date(dateString);
-    const options = { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    };
-    return date.toLocaleDateString('it-IT', options);
-  };
+  async function chiediSpunti() {
+    const risposta = await chiedi('spunti', 'spunti');
+    if (risposta) setSpunti(risposta);
+  }
+
+  const settimana = useMemo(() => {
+    const limite = new Date();
+    limite.setHours(0, 0, 0, 0);
+    limite.setDate(limite.getDate() - 6);
+    return voci.filter((v) => new Date(v.date) >= limite);
+  }, [voci]);
+
+  async function chiediRiassunto() {
+    const risposta = await chiedi('settimana', 'settimana', {
+      voci: settimana.slice(0, 60).map((v) => ({ giorno: giornoLungo(v.date), testo: v.text.slice(0, 2000) })),
+    });
+    if (risposta) setRiassunto(risposta);
+  }
+
+  // Giorni del giardino, dal più vecchio a oggi.
+  const perGiorno = useMemo(() => {
+    const mappa = new Map();
+    for (const v of voci) {
+      const g = chiaveGiorno(v.date);
+      mappa.set(g, (mappa.get(g) ?? 0) + 1);
+    }
+    return mappa;
+  }, [voci]);
+
+  const giorni = useMemo(() => {
+    const elenco = [];
+    for (let i = quantiGiorni - 1; i >= 0; i -= 1) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const g = chiaveGiorno(d);
+      elenco.push({ giorno: g, quante: perGiorno.get(g) ?? 0, oggi: g === oggi, etichetta: giornoLungo(d) });
+    }
+    // Un fiore si apre quando il giorno prima o il giorno dopo c'è un'altra pianta.
+    return elenco.map((g, i) => ({
+      ...g,
+      fila: g.quante > 0 && ((elenco[i - 1]?.quante ?? 0) > 0 || (elenco[i + 1]?.quante ?? 0) > 0),
+    }));
+  }, [perGiorno, quantiGiorni, oggi]);
+
+  const giorniDiFila = useMemo(() => {
+    let conta = 0;
+    const d = new Date();
+    if (!perGiorno.get(chiaveGiorno(d))) d.setDate(d.getDate() - 1); // oggi non è ancora finito
+    while (perGiorno.get(chiaveGiorno(d))) {
+      conta += 1;
+      d.setDate(d.getDate() - 1);
+    }
+    return conta;
+  }, [perGiorno]);
+
+  const mostrate = scelto
+    ? voci.filter((v) => chiaveGiorno(v.date) === scelto)
+    : vista === 'oggi'
+      ? voci.filter((v) => chiaveGiorno(v.date) === oggi)
+      : vista === 'tutte'
+        ? voci
+        : [];
+
+  function esporta() {
+    const blob = new Blob([JSON.stringify({ app: 'giardino-della-gratitudine', versione: 2, voci }, null, 2)], { type: 'application/json' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `giardino-${oggi}.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
+  async function caricaBackup(evento) {
+    const file = evento.target.files?.[0];
+    evento.target.value = '';
+    if (!file) return;
+    try {
+      const dati = JSON.parse(await file.text());
+      const arrivate = (Array.isArray(dati) ? dati : dati.voci) ?? [];
+      const valide = arrivate.filter((v) => v && typeof v.text === 'string' && !Number.isNaN(new Date(v.date).getTime()));
+      if (!valide.length) throw new Error();
+      setVoci((prima) => {
+        const presenti = new Set(prima.map((v) => v.id));
+        const nuove = valide
+          .filter((v) => !presenti.has(v.id))
+          .map((v) => ({ id: v.id ?? Date.now() + Math.random(), text: v.text, date: v.date, insight: typeof v.insight === 'string' ? v.insight : '' }));
+        setAvviso(nuove.length ? `Ho aggiunto ${nuove.length} gratitudini dal backup.` : 'Queste gratitudini erano già nel giardino.');
+        return [...nuove, ...prima].sort((a, b) => new Date(b.date) - new Date(a.date));
+      });
+    } catch {
+      setAvviso('Questo file non sembra un backup del Giardino.');
+    }
+  }
+
+  const piante = perGiorno.size;
+  const occupato = Boolean(inCorso);
+
+  return (
+    <>
+      <section className="aiuola" aria-labelledby="titolo-giardino">
+        <div className="aiuola-testa">
+          <h2 id="titolo-giardino" className="titoletto">Il tuo giardino</h2>
+          <p className="conteggio">
+            {piante === 0 ? 'Ancora nessuna pianta' : piante === 1 ? 'Una pianta' : `${piante} piante`}
+            {giorniDiFila > 1 && <> · {giorniDiFila} giorni di fila</>}
+          </p>
+        </div>
+        <Giardino giorni={giorni} scelto={scelto} onScegli={setScelto} />
+        <p className="didascalia">
+          {piante === 0
+            ? 'Scrivi la tua prima gratitudine: spunterà la prima pianta.'
+            : 'Ogni giorno grato fa spuntare una pianta; i giorni vicini la fanno fiorire. Tocca una pianta per rileggerla.'}
+        </p>
+      </section>
+
+      <section className="foglio quaderno">
+        <div className="domanda">
+          <p className="mano">{domanda || (inCorso === 'domanda' ? 'Sto cercando la domanda di oggi…' : 'Di cosa ti senti grata o grato oggi?')}</p>
+          <button className="leggero" type="button" onClick={nuovaDomanda} disabled={occupato}>
+            Un'altra domanda
+          </button>
+        </div>
+
+        <form onSubmit={aggiungi}>
+          <label htmlFor="nuova" className="etichetta">Oggi sono grata o grato per…</label>
+          <textarea
+            id="nuova"
+            className="righe"
+            value={testo}
+            onChange={(e) => setTesto(e.target.value)}
+            maxLength={2000}
+            rows={4}
+            placeholder="Una persona, un momento, una piccola cosa…"
+          />
+          <div className="azioni">
+            <button className="principale" type="submit" disabled={!testo.trim() || inCorso === 'commento'}>
+              {inCorso === 'commento' ? 'Sto piantando…' : 'Pianta questa gratitudine'}
+            </button>
+            <button className="secondario" type="button" onClick={chiediSpunti} disabled={occupato}>
+              {inCorso === 'spunti' ? 'Cerco spunti…' : 'Dammi qualche spunto'}
+            </button>
+          </div>
+        </form>
+
+        {avviso && <p className="avviso" role="status">{avviso}</p>}
+        {commento && <p className="biglietto mano">{commento}</p>}
+        {spunti && <div className="biglietto spunti">{spunti}</div>}
+      </section>
+
+      <section className="foglio pagine">
+        <div className="schede" role="tablist" aria-label="Quali gratitudini vedere">
+          {[
+            ['oggi', `Oggi (${voci.filter((v) => chiaveGiorno(v.date) === oggi).length})`],
+            ['tutte', `Tutto il quaderno (${voci.length})`],
+            ['settimana', 'La settimana'],
+          ].map(([id, nome]) => (
+            <button
+              key={id}
+              role="tab"
+              type="button"
+              aria-selected={!scelto && vista === id}
+              className={!scelto && vista === id ? 'attiva' : ''}
+              onClick={() => {
+                setScelto(null);
+                setVista(id);
+              }}
+            >
+              {nome}
+            </button>
+          ))}
+        </div>
+
+        {scelto && (
+          <p className="giorno-scelto">
+            <span>{giornoLungo(daChiave(scelto))}</span>
+            <button className="leggero" type="button" onClick={() => setScelto(null)}>Chiudi</button>
+          </p>
+        )}
+
+        {!scelto && vista === 'settimana' ? (
+          <div className="settimana">
+            <p>
+              {settimana.length
+                ? `Negli ultimi sette giorni hai scritto ${settimana.length === 1 ? 'una gratitudine' : `${settimana.length} gratitudini`}.`
+                : 'Negli ultimi sette giorni non hai ancora scritto nulla.'}
+            </p>
+            {settimana.length > 0 && (
+              <button className="secondario" type="button" onClick={chiediRiassunto} disabled={occupato}>
+                {inCorso === 'settimana' ? 'Sto rileggendo la settimana…' : 'Rileggi la settimana con l’AI'}
+              </button>
+            )}
+            {riassunto && <p className="biglietto mano">{riassunto}</p>}
+          </div>
+        ) : mostrate.length ? (
+          <ol className="voci">
+            {mostrate.map((v) => (
+              <li key={v.id}>
+                <div className="voce-testa">
+                  <time dateTime={v.date}>{vista === 'oggi' && !scelto ? ora(v.date) : `${giornoLungo(v.date)}, ${ora(v.date)}`}</time>
+                  <button className="elimina" type="button" onClick={() => elimina(v)} aria-label="Elimina questa gratitudine" title="Elimina">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" /></svg>
+                  </button>
+                </div>
+                <p className="voce-testo">{v.text}</p>
+                {v.insight && <p className="voce-nota mano">{v.insight}</p>}
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="vuoto">
+            {vista === 'oggi' && !scelto ? 'Oggi il quaderno è ancora bianco.' : 'Il quaderno è ancora vuoto: scrivi la prima gratitudine qui sopra.'}
+          </p>
+        )}
+      </section>
+
+      <footer className="piede">
+        <p>
+          Le gratitudini restano solo in questo browser. Quando chiedi un commento, uno spunto o il riassunto, il testo viene inviato a
+          OpenAI per la risposta.
+        </p>
+        <div className="piede-azioni">
+          <button className="leggero" type="button" onClick={esporta} disabled={!voci.length}>Salva un backup</button>
+          <button className="leggero" type="button" onClick={() => importa.current?.click()}>Carica un backup</button>
+          <input ref={importa} type="file" accept="application/json,.json" hidden onChange={caricaBackup} />
+          <button className="leggero" type="button" onClick={() => onEsci()}>Esci</button>
+        </div>
+      </footer>
+    </>
+  );
+}
+
+export default function Home() {
+  const [codice, setCodice] = useState(null);
+  const [pronto, setPronto] = useState(false);
+  const [messaggio, setMessaggio] = useState('');
+  const [periodo, setPeriodo] = useState('autunno');
+  const [data, setData] = useState('');
+
+  useEffect(() => {
+    setPeriodo(stagione());
+    setData(giornoLungo(new Date()));
+    const salvato = leggi(CHIAVE_CODICE, null);
+    if (!salvato) return setPronto(true);
+    fetch('/api/accesso', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ codice: salvato }) })
+      .then((r) => (r.ok ? setCodice(salvato) : localStorage.removeItem(CHIAVE_CODICE)))
+      .catch(() => setCodice(salvato))
+      .finally(() => setPronto(true));
+  }, []);
+
+  function entra(nuovo) {
+    scrivi(CHIAVE_CODICE, nuovo);
+    setMessaggio('');
+    setCodice(nuovo);
+  }
+
+  function esci(motivo = '') {
+    try {
+      localStorage.removeItem(CHIAVE_CODICE);
+    } catch {}
+    setMessaggio(motivo);
+    setCodice(null);
+  }
 
   return (
     <>
       <Head>
-        <title>Giardino di Gratitudine</title>
-        <meta name="description" content="Il tuo giardino personale per coltivare la gratitudine" />
-        <link rel="icon" href="/favicon.ico" />
+        <title>Giardino della Gratitudine</title>
+        <meta name="description" content="Un diario della gratitudine che diventa un giardino: ogni giorno grato fa crescere una pianta." />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
-
-      <div className="min-h-screen py-8 px-4 relative z-10">
-        <div className="max-w-5xl mx-auto">
-          
-          {/* Header */}
-          <motion.header 
-            className="text-center mb-12 animate-fade-in"
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.6 }}
-          >
-            <div className="inline-block mb-4">
-              <div className="w-16 h-16 mx-auto bg-gradient-to-br from-terracotta-400 to-terracotta-600 rounded-full flex items-center justify-center shadow-lg">
-                <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
-                </svg>
-              </div>
-            </div>
-            <h1 className="text-5xl md:text-6xl font-bold text-sand-900 mb-3">
-              Giardino di Gratitudine
-            </h1>
-            <p className="text-xl text-sand-600 font-serif italic">
-              Coltiva la gioia, raccogli i frutti della gratitudine
-            </p>
-          </motion.header>
-
-          {/* Reflection Prompt */}
-          {reflectionPrompt && (
-            <motion.div 
-              className="glass-card rounded-2xl p-6 mb-8 border-l-4 border-sage-400 animate-slide-in"
-              initial={{ opacity: 0, x: -30 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: 0.2 }}
-            >
-              <div className="flex items-start gap-4">
-                <div className="flex-shrink-0 w-10 h-10 bg-sage-100 rounded-full flex items-center justify-center">
-                  <span className="text-2xl">💭</span>
-                </div>
-                <div className="flex-1">
-                  <h3 className="font-semibold text-sage-800 mb-2">Riflessione del giorno</h3>
-                  <p className="text-sand-700 leading-relaxed font-serif">{reflectionPrompt}</p>
-                </div>
-                <button
-                  onClick={generateReflectionPrompt}
-                  className="flex-shrink-0 text-sage-600 hover:text-sage-800 transition-colors"
-                  disabled={loading}
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </button>
-              </div>
-            </motion.div>
-          )}
-
-          {/* New Entry Card */}
-          <motion.div 
-            className="glass-card rounded-2xl p-6 md:p-8 mb-8 stagger-1 opacity-0 animate-slide-in"
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ delay: 0.3 }}
-          >
-            <h2 className="text-2xl font-bold text-sand-900 mb-4 flex items-center gap-2">
-              <span className="text-3xl">✨</span>
-              Per cosa sei grato oggi?
-            </h2>
-            
-            <textarea
-              value={newEntry}
-              onChange={(e) => setNewEntry(e.target.value)}
-              placeholder="Scrivi qui la tua gratitudine del giorno..."
-              className="w-full h-32 p-4 rounded-xl border-2 border-sand-200 focus:border-terracotta-400 focus:outline-none resize-none bg-white/50 text-sand-900 font-serif text-lg transition-all"
-              disabled={loading}
-            />
-            
-            <div className="flex flex-wrap gap-3 mt-4">
-              <button
-                onClick={addEntry}
-                className="btn-primary flex items-center gap-2"
-                disabled={loading || !newEntry.trim()}
-              >
-                {loading ? (
-                  <>
-                    <svg className="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    Salvando...
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                    </svg>
-                    Aggiungi Gratitudine
-                  </>
-                )}
-              </button>
-              
-              <button
-                onClick={getSuggestions}
-                className="btn-secondary flex items-center gap-2"
-                disabled={loading}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                </svg>
-                Suggerimenti AI
-              </button>
-            </div>
-
-            {/* AI Insight */}
-            <AnimatePresence>
-              {aiInsight && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="mt-4 p-4 bg-terracotta-50 border-l-4 border-terracotta-400 rounded-r-xl"
-                >
-                  <p className="text-terracotta-900 font-serif italic">{aiInsight}</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* AI Suggestions */}
-            <AnimatePresence>
-              {aiSuggestions && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="mt-4 p-4 bg-sage-50 border-l-4 border-sage-400 rounded-r-xl"
-                >
-                  <h4 className="font-semibold text-sage-800 mb-2">💡 Suggerimenti:</h4>
-                  <div className="text-sage-900 whitespace-pre-line font-serif">
-                    {aiSuggestions}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-
-          {/* Tabs */}
-          <div className="flex gap-2 mb-6 stagger-2 opacity-0 animate-slide-in">
-            <button
-              onClick={() => setActiveTab('today')}
-              className={`px-6 py-3 rounded-xl font-medium transition-all ${
-                activeTab === 'today'
-                  ? 'bg-terracotta-500 text-white shadow-md'
-                  : 'bg-white/60 text-sand-700 hover:bg-white'
-              }`}
-            >
-              Oggi ({getTodayEntries().length})
-            </button>
-            <button
-              onClick={() => setActiveTab('all')}
-              className={`px-6 py-3 rounded-xl font-medium transition-all ${
-                activeTab === 'all'
-                  ? 'bg-terracotta-500 text-white shadow-md'
-                  : 'bg-white/60 text-sand-700 hover:bg-white'
-              }`}
-            >
-              Tutte ({entries.length})
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('weekly');
-                generateWeeklySummary();
-              }}
-              className={`px-6 py-3 rounded-xl font-medium transition-all ${
-                activeTab === 'weekly'
-                  ? 'bg-terracotta-500 text-white shadow-md'
-                  : 'bg-white/60 text-sand-700 hover:bg-white'
-              }`}
-            >
-              Settimana
-            </button>
-          </div>
-
-          {/* Weekly Insight */}
-          {activeTab === 'weekly' && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="glass-card rounded-2xl p-6 mb-8"
-            >
-              <h3 className="text-2xl font-bold text-sand-900 mb-4 flex items-center gap-2">
-                <span className="text-3xl">📊</span>
-                Riassunto Settimanale
-              </h3>
-              {loading ? (
-                <div className="flex items-center justify-center py-8">
-                  <svg className="animate-spin h-8 w-8 text-terracotta-500" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                  </svg>
-                </div>
-              ) : weeklyInsight ? (
-                <p className="text-sand-700 font-serif text-lg leading-relaxed">{weeklyInsight}</p>
-              ) : (
-                <p className="text-sand-500 italic">Generazione del riassunto...</p>
-              )}
-            </motion.div>
-          )}
-
-          {/* Entries List */}
-          <div className="space-y-4 stagger-3 opacity-0 animate-slide-in">
-            <AnimatePresence>
-              {(activeTab === 'today' ? getTodayEntries() : activeTab === 'all' ? entries : []).map((entry, index) => (
-                <motion.div
-                  key={entry.id}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: 20 }}
-                  transition={{ delay: index * 0.05 }}
-                  className="entry-card hover:shadow-lg from-terracotta-400 to-terracotta-600"
-                >
-                  <div className="flex justify-between items-start mb-3">
-                    <time className="text-sm text-sand-500 font-medium">
-                      {formatDate(entry.date)}
-                    </time>
-                    <button
-                      onClick={() => deleteEntry(entry.id)}
-                      className="text-sand-400 hover:text-terracotta-500 transition-colors"
-                    >
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
-                  </div>
-                  
-                  <p className="text-sand-900 font-serif text-lg leading-relaxed mb-3">
-                    {entry.text}
-                  </p>
-                  
-                  {entry.insight && (
-                    <div className="mt-4 pt-4 border-t border-sand-200">
-                      <p className="text-terracotta-700 text-sm italic font-serif">
-                        💫 {entry.insight}
-                      </p>
-                    </div>
-                  )}
-                </motion.div>
-              ))}
-            </AnimatePresence>
-            
-            {(activeTab === 'today' ? getTodayEntries() : activeTab === 'all' ? entries : []).length === 0 && activeTab !== 'weekly' && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="text-center py-16"
-              >
-                <div className="text-6xl mb-4">🌱</div>
-                <p className="text-sand-500 text-lg font-serif">
-                  {activeTab === 'today' 
-                    ? 'Non hai ancora scritto nulla oggi. Inizia il tuo viaggio di gratitudine!' 
-                    : 'Il tuo diario è vuoto. Aggiungi la tua prima gratitudine!'}
-                </p>
-              </motion.div>
-            )}
-          </div>
-
-          {/* Footer */}
-          <footer className="mt-16 text-center text-sand-500 text-sm stagger-4 opacity-0 animate-fade-in">
-            <p>💚 Ogni giorno è un'opportunità per essere grati</p>
-          </footer>
-        </div>
+      <div className={`pagina ${periodo}`}>
+        <main className="contenitore">
+          <header className="testata">
+            <svg className="marchio" viewBox="0 0 40 40" aria-hidden="true">
+              <path d="M20 36V18" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+              <path d="M20 24c-7 0-11-5-11-11 7 0 11 5 11 11zM20 20c0-7 4-12 11-12 0 7-4 12-11 12z" fill="currentColor" />
+            </svg>
+            <h1>Giardino della Gratitudine</h1>
+            {data && <p className="data mano">{data}</p>}
+          </header>
+          {!pronto ? null : codice ? <Diario codice={codice} onEsci={esci} /> : <Entrata onEntra={entra} messaggio={messaggio} />}
+        </main>
       </div>
     </>
   );
